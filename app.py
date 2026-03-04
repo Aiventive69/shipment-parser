@@ -1,135 +1,225 @@
 """
-app.py
-------
-Flask API voor de shipment parser.
-Make.com stuurt de bestandsinhoud als POST → krijgt JSON records terug.
+app.py - Shipment parser API voor Render.com
+Gebaseerd op het echte bestandsformaat van de klant.
 
-Endpoint: POST /parse
-Body (JSON): { "text": "...bestandsinhoud..." }
-Response:    { "records": [ {...}, ... ], "count": 5 }
+Formaat per shipment (alles plat, spatie-gescheiden):
+SEA {job_nr} {vessel} {voyage} {bl_number} {pol} {city_pod} {etd} {eta} [atd]
+{shipper} {fcl/lcl} {container} {container_type} {bl_ref} {weight} {cbm} {qty}
+[K-nummers lijst] [regelitems: {seq} {k_nr} {omschrijving} {qty} CARTONS/PALLETS {weight} {cbm}]
 """
 
-import json
-import logging
 import re
-from typing import Any, Dict, List, Tuple
-
+import logging
+from typing import Any, Dict, List, Optional
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# CONFIG — pas dit aan als het bestand van je klant er anders uitziet
+# CONFIG
 # ---------------------------------------------------------------------------
 
-SHIPMENT_BLOCK_MARKER: str = r"^(SEA|AIR|ROAD|RAIL|SHIPMENT)\b"
-
-K_NUMBER_PATTERN: str = r"\b(KM?\d{2,4}-\d{4,6})\b"
-
-HEADER_FIELDS: List[Tuple[str, str, int]] = [
-    ("container",    r"CONTAINER[:\s#]*([A-Z]{4}\d{7})",                1),
-    ("vessel",       r"VESSEL[:\s]*([A-Z0-9 /\-]{3,40}?)(?:\s{2,}|$)", 1),
-    ("voyage",       r"VOY(?:AGE)?[:\s#]*([A-Z0-9\-]+)",               1),
-    ("pol",          r"POL[:\s]*([A-Z\s,]+?)(?:\s{2,}|$)",             1),
-    ("pod",          r"POD[:\s]*([A-Z\s,]+?)(?:\s{2,}|$)",             1),
-    ("etd",          r"ETD[:\s]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})", 1),
-    ("eta",          r"ETA[:\s]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})", 1),
-    ("booking_ref",  r"B(?:OOKING)?[:\s#]*([A-Z0-9\-]{4,20})",        1),
-    ("shipper",      r"SHIPPER[:\s]*(.+?)(?:\s{2,}|$)",                1),
-    ("consignee",    r"CONSIGNEE[:\s]*(.+?)(?:\s{2,}|$)",              1),
-]
-
-LINE_FIELDS: List[Tuple[str, str, int]] = [
-    ("quantity",    r"(\d[\d,\.]*)\s*(CARTONS?|PALLETS?|PIECES?|PCS|CTNS?|PLT)", 1),
-    ("unit",        r"(\d[\d,\.]*)\s*(CARTONS?|PALLETS?|PIECES?|PCS|CTNS?|PLT)", 2),
-    ("weight_kg",   r"(\d[\d,\.]+)\s*KG",                              1),
-    ("cbm",         r"(\d[\d,\.]+)\s*CBM",                             1),
-    ("description", r"(?:DESCRIPTION|DESC|GOODS)[:\s]*(.+?)(?:\s{2,}|$)", 1),
-]
+K_PATTERN = re.compile(r'\b(K(?:M?\d{2,4}|\d{2,4})-\d{3,6})\b', re.IGNORECASE)
+DATE_PATTERN = re.compile(r'\b(\d{2}/\d{2}/\d{4})\b')
+CONTAINER_PATTERN = re.compile(r'\b([A-Z]{4}\d{7})\b')
+UNIT_PATTERN = re.compile(r'\b(CARTONS?|PALLETS?|PACKAGES?|PIECES?|PCS|CTNS?)\b', re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
-# PARSER FUNCTIES (zelfde logica als shipment_parser.py)
+# HELPERS
 # ---------------------------------------------------------------------------
 
-def _search(pattern: str, text: str, group: int = 1) -> str:
-    m = re.search(pattern, text, re.IGNORECASE)
-    return m.group(group).strip() if m else ""
+def normalise_k(k: str) -> str:
+    return k.upper().strip()
 
-def _normalise_k(raw: str) -> str:
-    return raw.upper().strip()
+def find_all_k(text: str) -> List[str]:
+    return [normalise_k(m) for m in K_PATTERN.findall(text)]
+
+def find_dates(text: str) -> List[str]:
+    return DATE_PATTERN.findall(text)
+
+def find_containers(text: str) -> List[str]:
+    return CONTAINER_PATTERN.findall(text)
+
+# ---------------------------------------------------------------------------
+# SPLIT INTO SHIPMENT BLOCKS
+# ---------------------------------------------------------------------------
 
 def split_shipments(text: str) -> List[str]:
-    marker_re = re.compile(SHIPMENT_BLOCK_MARKER, re.IGNORECASE | re.MULTILINE)
-    lines = text.splitlines(keepends=True)
-    blocks: List[str] = []
-    current: List[str] = []
-    for line in lines:
-        if marker_re.match(line.strip()) and current:
-            blocks.append("".join(current))
-            current = [line]
-        else:
-            current.append(line)
-    if current:
-        blocks.append("".join(current))
-    k_re = re.compile(K_NUMBER_PATTERN, re.IGNORECASE)
-    return [b for b in blocks if k_re.search(b)]
+    """Split de platte tekst op elke 'SEA {nummer}' marker."""
+    parts = re.split(r'(?=\bSEA\s+\d{8}\b)', text.strip())
+    valid = [p.strip() for p in parts if p.strip() and K_PATTERN.search(p)]
+    log.info("split_shipments: %d blokken gevonden", len(valid))
+    return valid
+
+# ---------------------------------------------------------------------------
+# PARSE SHIPMENT HEADER
+# ---------------------------------------------------------------------------
 
 def extract_header(block: str) -> Dict[str, str]:
-    header: Dict[str, str] = {key: "" for key, *_ in HEADER_FIELDS}
-    for line in block.splitlines():
-        line_upper = line.upper()
-        for key, pattern, group in HEADER_FIELDS:
-            if header[key]:
-                continue
-            val = _search(pattern, line_upper, group)
-            if val:
-                header[key] = val.title() if key in ("pol", "pod", "shipper", "consignee") else val
+    """
+    Haalt shipment-level info uit een blok.
+    Volgorde in het bestand: SEA jobnr vessel voyage bl_nr pol pod etd [eta] [atd]
+    """
+    tokens = block.split()
+    header: Dict[str, str] = {
+        "job_number": "",
+        "vessel": "",
+        "voyage": "",
+        "bl_number": "",
+        "pol": "",
+        "pod": "Rotterdam",  # altijd Rotterdam in dit bestand
+        "etd": "",
+        "eta": "",
+        "atd": "",
+        "shipper": "",
+        "transport_type": "",  # FCL / LCL
+        "container": "",
+        "container_type": "",
+        "total_weight": "",
+        "total_cbm": "",
+        "total_pieces": "",
+    }
+
+    # Job number: eerste getal na SEA
+    m = re.match(r'SEA\s+(\d{8})', block)
+    if m:
+        header["job_number"] = m.group(1)
+
+    # Alle datums in het blok
+    dates = find_dates(block)
+    if len(dates) >= 1:
+        header["etd"] = dates[0]
+    if len(dates) >= 2:
+        header["eta"] = dates[1]
+    if len(dates) >= 3:
+        header["atd"] = dates[2]
+
+    # Containers
+    containers = find_containers(block)
+    if containers:
+        header["container"] = containers[0]
+
+    # FCL / LCL
+    fcl_lcl = re.search(r'\b(FCL|LCL)\b', block)
+    if fcl_lcl:
+        header["transport_type"] = fcl_lcl.group(1)
+
+    # Container type (20STD, 40HC, 40STD etc.)
+    ct = re.search(r'\b(20STD|40STD|40HC|20HC|45HC)\b', block)
+    if ct:
+        header["container_type"] = ct.group(1)
+
+    # Vessel + voyage: na het job_number komen vessel naam en voyage
+    # Patroon: na job_nr een reeks hoofdletters/cijfers/spaties tot aan een BL-nummer
+    # BL-nummer herkennen: begint met 2 letters + cijfers of TJRTM/NBRTM etc.
+    vessel_block = re.search(
+        r'SEA\s+\d{8}\s+(.*?)\s+([A-Z]{2,6}\d{2,4}[A-Z0-9]*)\s+',
+        block
+    )
+    if vessel_block:
+        header["vessel"] = vessel_block.group(1).strip()
+        header["voyage"] = vessel_block.group(2).strip()
+
+    # POL: stad voor Rotterdam (laatste woord voor Rotterdam)
+    pol_match = re.search(r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+Rotterdam', block)
+    if pol_match:
+        header["pol"] = pol_match.group(1).strip()
+
+    # Shipper: naam voor FCL/LCL (voor het transport type keyword)
+    shipper_match = re.search(r'Rotterdam\s+(?:\d{2}/\d{2}/\d{4}\s+)*(.+?)\s+(?:FCL|LCL)\b', block)
+    if shipper_match:
+        header["shipper"] = shipper_match.group(1).strip()
+
+    # Totalen: drie getallen vlak voor de K-nummers lijst
+    # Patroon: getal getal getal gevolgd door K-nummer
+    totals_match = re.search(
+        r'(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+)\s+(?:K(?:M?\d|24|25))',
+        block
+    )
+    if totals_match:
+        header["total_weight"] = totals_match.group(1)
+        header["total_cbm"] = totals_match.group(2)
+        header["total_pieces"] = totals_match.group(3)
+
     return header
 
+# ---------------------------------------------------------------------------
+# PARSE ORDER LINES
+# ---------------------------------------------------------------------------
+
 def extract_lines(block: str) -> List[Dict[str, Any]]:
-    k_re = re.compile(K_NUMBER_PATTERN, re.IGNORECASE)
+    """
+    Haalt individuele K-nummer orderregels uit een blok.
+    Patroon per regel: {seq_nr} {K-nummer} {omschrijving?} {qty} CARTONS/PALLETS {weight} {cbm}
+    """
     results: List[Dict[str, Any]] = []
-    for line in block.splitlines():
-        m = k_re.search(line)
-        if not m:
-            continue
-        record: Dict[str, Any] = {
-            "k_number": _normalise_k(m.group(1)),
-            "raw_line": line.strip(),
-        }
-        line_upper = line.upper()
-        for key, pattern, group in LINE_FIELDS:
-            record[key] = _search(pattern, line_upper, group)
-        results.append(record)
+
+    # Zoek alle occurrences van: getal K-nummer ... qty UNIT weight cbm
+    line_pattern = re.compile(
+        r'(\d{1,2})\s+'                          # seq nummer
+        r'(K(?:M?\d{2,4}|\d{2,4})-\d{3,6})\s+'  # K-nummer
+        r'(.*?)'                                   # optionele omschrijving
+        r'(\d[\d,\.]*)\s+'                         # quantity
+        r'(CARTONS?|PALLETS?|PACKAGES?|PIECES?|PCS|CTNS?)\s+'  # unit
+        r'(\d[\d,\.]*)\s+'                         # weight
+        r'(\d[\d,\.]*)',                           # cbm
+        re.IGNORECASE
+    )
+
+    for m in line_pattern.finditer(block):
+        seq         = m.group(1)
+        k_raw       = m.group(2)
+        description = m.group(3).strip()
+        quantity    = m.group(4)
+        unit        = m.group(5).upper()
+        weight      = m.group(6)
+        cbm         = m.group(7)
+
+        results.append({
+            "k_number":    normalise_k(k_raw),
+            "seq":         seq,
+            "description": description,
+            "quantity":    quantity,
+            "unit":        unit,
+            "weight_kg":   weight,
+            "cbm":         cbm,
+            "raw_line":    m.group(0).strip(),
+        })
+
     return results
 
+# ---------------------------------------------------------------------------
+# MAIN PARSE
+# ---------------------------------------------------------------------------
+
 def parse(text: str) -> List[Dict[str, Any]]:
+    """
+    Hoofdfunctie: geeft één record per unieke K-nummer + seq combinatie.
+    K-nummers die meerdere keren voorkomen (zelfde K, verschillende seq)
+    krijgen elk hun eigen record met de shipment-header erbij.
+    """
     blocks = split_shipments(text)
-    merged: Dict[str, Dict[str, Any]] = {}
-    for block_idx, block in enumerate(blocks):
+    results: List[Dict[str, Any]] = []
+    seen_keys = set()
+
+    for block in blocks:
         header = extract_header(block)
-        lines = extract_lines(block)
-        for line_rec in lines:
-            k = line_rec["k_number"]
-            if k not in merged:
-                record: Dict[str, Any] = {
-                    "k_number":    k,
-                    "raw_line":    line_rec["raw_line"],
-                    "block_index": block_idx,
-                    **header,
-                    **{f: line_rec.get(f, "") for f, *_ in LINE_FIELDS},
-                }
-                merged[k] = record
-            else:
-                existing = merged[k]
-                for field in list(header.keys()) + [f for f, *_ in LINE_FIELDS]:
-                    new_val = line_rec.get(field) or header.get(field, "")
-                    if new_val and not existing.get(field):
-                        existing[field] = new_val
-    return list(merged.values())
+        lines  = extract_lines(block)
+
+        for line in lines:
+            # Dedup key = k_number + seq + job_number
+            dedup_key = f"{line['k_number']}_{line['seq']}_{header['job_number']}"
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+
+            record = {**header, **line}
+            results.append(record)
+
+    log.info("parse: %d records gevonden", len(results))
+    return results
 
 # ---------------------------------------------------------------------------
 # API ENDPOINTS
@@ -137,19 +227,13 @@ def parse(text: str) -> List[Dict[str, Any]]:
 
 @app.route("/", methods=["GET"])
 def health():
-    """Health check — Render gebruikt dit om te checken of de service leeft."""
-    return jsonify({"status": "ok", "message": "Shipment parser API is running"})
+    return jsonify({"status": "ok", "message": "Shipment parser API draait"})
 
 @app.route("/parse", methods=["POST"])
 def parse_endpoint():
-    """
-    Verwacht JSON body: { "text": "...bestandsinhoud..." }
-    Geeft terug:        { "records": [...], "count": N }
-    """
     data = request.get_json(silent=True)
-
     if not data or "text" not in data:
-        return jsonify({"error": "Geef een JSON body mee met een 'text' veld"}), 400
+        return jsonify({"error": "Geef een JSON body met een 'text' veld"}), 400
 
     text = data["text"]
     if not isinstance(text, str) or not text.strip():
@@ -157,13 +241,10 @@ def parse_endpoint():
 
     try:
         records = parse(text)
-        log.info("Parsed %d records from %d chars", len(records), len(text))
         return jsonify({"records": records, "count": len(records)})
     except Exception as e:
-        log.error("Parse error: %s", e)
+        log.error("Parse fout: %s", e)
         return jsonify({"error": str(e)}), 500
-
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
