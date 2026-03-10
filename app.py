@@ -46,20 +46,25 @@ def parse(text: str) -> List[Dict[str, Any]]:
         # Vessel info
         v = shipment.find("Vessel")
         vessel_data = {
-            "transport_type": _txt(v, "Type"),
-            "job_number":     _txt(v, "RitraRef"),
-            "vessel":         _txt(v, "ModalityName"),
-            "voyage":         _txt(v, "Voyage"),
-            "bl_number":      _txt(v, "BLnumber"),
-            "pol":            _txt(v, "PortOfLoading"),
-            "pod":            _txt(v, "PortOfDischarge"),
-            "etd":            _txt(v, "ETD"),
-            "eta":            _txt(v, "ETA"),
-            "ata":            _txt(v, "ATA"),
+            "transport_type":    _txt(v, "Type"),
+            "job_number":        _txt(v, "RitraRef"),
+            "vessel":            _txt(v, "ModalityName"),
+            "voyage":            _txt(v, "Voyage"),
+            "carrier":           _txt(v, "Carrier"),
+            "bl_number":         _txt(v, "BLnumber"),
+            "pol":               _txt(v, "PortOfLoading"),
+            "pod":               _txt(v, "PortOfDischarge"),
+            "etd":               _txt(v, "ETD"),
+            "eta":               _txt(v, "ETA"),
+            "ata":               _txt(v, "ATA"),
+            "initial_eta":       _txt(v, "Initial_ETA"),
+            "initial_leadtime":  _txt(v, "Initial_Leadtime"),
+            "real_leadtime":     _txt(v, "Real_Leadtime"),
         } if v is not None else {}
 
-        # Shipper
+        # Shipment info
         shipper = _txt(shipment, "Shippername")
+        status  = _txt(shipment, "Status")
 
         # Container (eerste)
         c = shipment.find("Container")
@@ -72,19 +77,20 @@ def parse(text: str) -> List[Dict[str, Any]]:
             "total_weight":   _txt(c, "Weight"),
             "total_cbm":      _txt(c, "CBM"),
             "total_colli":    _txt(c, "Colli"),
+            "deliver_name":   _txt(c, "DeliverName"),
+            "deliver_street": _txt(c, "DeliverAddress"),
+            "deliver_zip":    _txt(c, "DeliverZip"),
+            "deliver_city":   _txt(c, "DeliverCity"),
+            "deliver_country":_txt(c, "DeliverCountry"),
+            "deliver_date":   _txt(c, "DeliverDate"),
         } if c is not None else {}
 
-        # Delivery info (optioneel)
-        d = shipment.find("Delivery")
-        delivery_data = {
-            "delivery_ref":     _txt(d, "DeliveryRef"),
-            "delivery_name":    _txt(d, "Name"),
-            "delivery_address": _txt(d, "Address"),
-            "delivery_date":    _txt(d, "DeliveryDate"),
-            "delivery_time":    _txt(d, "DeliveryTime"),
-        } if d is not None else {}
-
-        base = {**vessel_data, "shipper": shipper, **container_data, **delivery_data}
+        base = {
+            **vessel_data,
+            "shipper": shipper,
+            "status":  status,
+            **container_data,
+        }
 
         # Booking lines
         for line in shipment.findall(".//BookingLines/Line"):
